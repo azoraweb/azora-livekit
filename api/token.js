@@ -16,7 +16,7 @@ module.exports = async (req, res) => {
       });
     }
 
-    const at = new AccessToken(
+    const token = new AccessToken(
       process.env.LIVEKIT_API_KEY,
       process.env.LIVEKIT_API_SECRET,
       {
@@ -24,20 +24,19 @@ module.exports = async (req, res) => {
       }
     );
 
-    at.addGrant({
+    token.addGrant({
       roomJoin: true,
       room: "azora-main-room"
     });
 
-    const token = await at.toJwt();
-
     return res.status(200).json({
-      token
+      token: await token.toJwt()
     });
 
   } catch (err) {
     return res.status(500).json({
-      error: err.message
+      error: err.message,
+      stack: err.stack
     });
   }
 };
