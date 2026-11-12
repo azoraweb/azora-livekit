@@ -7,6 +7,11 @@
 //   HOST_PASSCODE       NEW: the host passcode (keep it ONLY here, never in the page)
 //   LIVEKIT_URL         optional, defaults to wss://azora-bxx8k12w.livekit.cloud
 //   ALLOWED_ORIGIN      optional, e.g. https://yoursite.com (defaults to *)
+//
+// Breakout rooms are saved in Upstash Redis when these exist (add the Upstash Redis
+// integration from the Vercel Marketplace and it sets them for you):
+//   KV_REST_API_URL + KV_REST_API_TOKEN   (or UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN)
+// Without Redis they are kept in LiveKit and last only while LiveKit keeps the main room alive.
 
 const crypto = require("crypto");
 const { AccessToken, TokenVerifier, RoomServiceClient } = require("livekit-server-sdk");
@@ -25,16 +30,38 @@ const eq = (a, b) => {
 };
 const hash = (room, pw) => crypto.createHmac("sha256", SECRET).update(room + ":" + pw).digest("hex");
 
-// Breakout list (id + title only, no passcodes) lives in the main room's metadata.
-async function getList() {
-  const [r] = await svc().listRooms([MAIN_ROOM]);
-  try { return JSON.parse((r && r.metadata) || "[]"); } catch (e) { return []; }
+// ---- Breakout storage: { rooms: [{ id, title, h }] }, h = keyed hash of the passcode ----
+const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const STATE_KEY = "azora:" + MAIN_ROOM + ":breakouts";
+
+async function redis(cmd) {
+  const r = await fetch(REDIS_URL, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + REDIS_TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify(cmd)
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.error) throw new Error(d.error || "Redis error");
+  return d.result;
 }
-async function setList(list) {
-  const s = svc();
-  await s.createRoom({ name: MAIN_ROOM, emptyTimeout: 43200 });
-  await s.updateRoomMetadata(MAIN_ROOM, JSON.stringify(list));
+async function getState() {
+  let raw;
+  if (REDIS_URL && REDIS_TOKEN) raw = await redis(["GET", STATE_KEY]);
+  else { const [r] = await svc().listRooms([MAIN_ROOM]); raw = r && r.metadata; }
+  try {
+    const st = JSON.parse(raw || "{}");
+    return { rooms: Array.isArray(st.rooms) ? st.rooms.filter(x => x && x.h) : [] };
+  } catch (e) { return { rooms: [] }; }
 }
+async function setState(st) {
+  const raw = JSON.stringify(st);
+  if (REDIS_URL && REDIS_TOKEN) return redis(["SET", STATE_KEY, raw]);
+  await ensureMain();
+  await svc().updateRoomMetadata(MAIN_ROOM, raw);
+}
+// Fallback mode only: create the main room ourselves with a long empty timeout (default is 5 minutes).
+const ensureMain = () => svc().createRoom({ name: MAIN_ROOM, emptyTimeout: 7 * 24 * 3600 });
 
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", process.env.ALLOWED_ORIGIN || "*");
@@ -70,18 +97,15 @@ module.exports = async (req, res) => {
 
       let room = MAIN_ROOM, title = "Azora Meeting", breakout = false;
       if (b.room && b.room !== MAIN_ROOM) {
-        const entry = (await getList()).find(x => x.id === b.room);
+        const entry = (await getState()).rooms.find(x => x.id === b.room);
         if (!entry) return fail(404, "That breakout room no longer exists.");
-        if (!host) {
-          const [r] = await svc().listRooms([b.room]);
-          let h; try { h = JSON.parse((r && r.metadata) || "{}").h; } catch (e) {}
-          if (!r || !eq(h, hash(b.room, String(b.passcode || "")))) return fail(403, "Wrong passcode for this room.");
-        }
+        if (!host && !eq(entry.h, hash(entry.id, String(b.passcode || "")))) return fail(403, "Wrong passcode for this room.");
         room = b.room; title = entry.title; breakout = true;
       } else if (!host && !caller && !eq(b.passcode, MEETING_PASSCODE)) {
         return fail(403, "Wrong passcode.");
       }
 
+      if (!(REDIS_URL && REDIS_TOKEN)) await ensureMain().catch(() => {});
       const identity = name + "-" + crypto.randomBytes(2).toString("hex");
       const at = new AccessToken(KEY, SECRET, { identity, name, ttl: "6h", metadata: JSON.stringify({ host }) });
       at.addGrant({ roomJoin: true, room, canPublish: true, canSubscribe: true, canPublishData: true });
@@ -90,7 +114,7 @@ module.exports = async (req, res) => {
 
     if (!caller) return fail(401, "Join the meeting first.");
 
-    if (action === "list") return res.status(200).json({ rooms: await getList() });
+    if (action === "list") return res.status(200).json({ rooms: (await getState()).rooms.map(({ id, title }) => ({ id, title })) });
 
     if (!caller.host) return fail(403, "Only hosts can do that.");
 
@@ -98,25 +122,27 @@ module.exports = async (req, res) => {
       const title = String(b.title || "").trim().slice(0, 40), pw = String(b.password || "");
       if (!title || pw.length < 3) return fail(400, "Give the room a name and a passcode of at least 3 characters.");
       const id = MAIN_ROOM + "__b_" + crypto.randomBytes(3).toString("hex");
-      await svc().createRoom({ name: id, emptyTimeout: 43200, metadata: JSON.stringify({ h: hash(id, pw) }) });
-      await setList([...(await getList()), { id, title }]);
+      const st = await getState();
+      st.rooms.push({ id, title, h: hash(id, pw) });
+      await setState(st);
       return res.status(200).json({ ok: true, id });
     }
 
-    const list = await getList();
-    if (!list.some(x => x.id === b.id)) return fail(404, "Unknown breakout room.");
+    const st = await getState();
+    const entry = st.rooms.find(x => x.id === b.id);
+    if (!entry) return fail(404, "Unknown breakout room.");
 
     if (action === "password") {
       const pw = String(b.password || "");
       if (pw.length < 3) return fail(400, "Passcode must be at least 3 characters.");
-      const s = svc();
-      await s.createRoom({ name: b.id, emptyTimeout: 43200 }); // no-op if it still exists
-      await s.updateRoomMetadata(b.id, JSON.stringify({ h: hash(b.id, pw) }));
+      entry.h = hash(entry.id, pw);
+      await setState(st);
       return res.status(200).json({ ok: true });
     }
 
     if (action === "close") {
-      await setList(list.filter(x => x.id !== b.id));
+      st.rooms = st.rooms.filter(x => x.id !== b.id);
+      await setState(st);
       try { await svc().deleteRoom(b.id); } catch (e) {}
       return res.status(200).json({ ok: true });
     }
