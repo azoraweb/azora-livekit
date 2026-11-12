@@ -1,0 +1,7 @@
+{
+  "name": "azora-livekit",
+  "version": "1.0.0",
+  "dependencies": {
+    "livekit-server-sdk": "^2.8.0"
+  }
+}
