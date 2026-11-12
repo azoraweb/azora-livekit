@@ -1,6 +1,14 @@
 const { AccessToken } = require("livekit-server-sdk");
 
 module.exports = async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
   try {
     if (req.method !== "POST") {
       return res.status(200).json({
@@ -16,7 +24,7 @@ module.exports = async (req, res) => {
       });
     }
 
-    const at = new AccessToken(
+    const token = new AccessToken(
       process.env.LIVEKIT_API_KEY,
       process.env.LIVEKIT_API_SECRET,
       {
@@ -24,15 +32,13 @@ module.exports = async (req, res) => {
       }
     );
 
-    at.addGrant({
+    token.addGrant({
       roomJoin: true,
       room: "azora-main-room"
     });
 
-    const token = await at.toJwt();
-
     return res.status(200).json({
-      token
+      token: await token.toJwt()
     });
 
   } catch (err) {
