@@ -24,6 +24,13 @@ const HOST_PASSCODE = process.env.HOST_PASSCODE;
 const MAIN_ROOM = process.env.MAIN_ROOM || "azora-main-room"; // same room name as your old file
 
 const svc = () => new RoomServiceClient(LIVEKIT_URL.replace(/^wss:/, "https:").replace(/^ws:/, "http:"), KEY, SECRET);
+const isHost = p => { try { return JSON.parse(p.metadata || "{}").host === true; } catch (e) { return false; } };
+const isAudio = t => t.type === 0 || t.type === "AUDIO";
+async function muteOne(room, p) {
+  for (const t of p.tracks || []) {
+    if (isAudio(t) && !t.muted) { try { await svc().mutePublishedTrack(room, p.identity, t.sid, true); } catch (e) {} }
+  }
+}
 const eq = (a, b) => {
   a = Buffer.from(String(a || "")); b = Buffer.from(String(b || ""));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
@@ -82,7 +89,7 @@ module.exports = async (req, res) => {
       try {
         const claims = await new TokenVerifier(KEY, SECRET).verify(bearer);
         let meta = {}; try { meta = JSON.parse(claims.metadata || "{}"); } catch (e) {}
-        caller = { host: meta.host === true };
+        caller = { host: meta.host === true, room: claims.video && claims.video.room };
       } catch (e) {}
     }
 
@@ -108,7 +115,7 @@ module.exports = async (req, res) => {
       if (!(REDIS_URL && REDIS_TOKEN)) await ensureMain().catch(() => {});
       const identity = name + "-" + crypto.randomBytes(2).toString("hex");
       const at = new AccessToken(KEY, SECRET, { identity, name, ttl: "6h", metadata: JSON.stringify({ host }) });
-      at.addGrant({ roomJoin: true, room, canPublish: true, canSubscribe: true, canPublishData: true });
+      at.addGrant({ roomJoin: true, room, canPublish: true, canSubscribe: true, canPublishData: true, canUpdateOwnMetadata: true });
       return res.status(200).json({ token: await at.toJwt(), host, breakout, title });
     }
 
@@ -117,6 +124,23 @@ module.exports = async (req, res) => {
     if (action === "list") return res.status(200).json({ rooms: (await getState()).rooms.map(({ id, title }) => ({ id, title })) });
 
     if (!caller.host) return fail(403, "Only hosts can do that.");
+
+    // Host controls act on the room the host is currently in (taken from their signed token).
+    if (action === "mute" || action === "muteall" || action === "remove") {
+      const room = caller.room;
+      if (!room) return fail(400, "Unknown room.");
+      const people = await svc().listParticipants(room);
+      if (action === "muteall") {
+        await Promise.all(people.filter(p => !isHost(p)).map(p => muteOne(room, p)));
+        return res.status(200).json({ ok: true });
+      }
+      const target = people.find(p => p.identity === b.identity);
+      if (!target) return fail(404, "That person already left.");
+      if (isHost(target)) return fail(403, "You can't do that to a host.");
+      if (action === "mute") await muteOne(room, target);
+      else await svc().removeParticipant(room, target.identity);
+      return res.status(200).json({ ok: true });
+    }
 
     if (action === "create") {
       const title = String(b.title || "").trim().slice(0, 40), pw = String(b.password || "");
